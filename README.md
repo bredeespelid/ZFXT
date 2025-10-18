@@ -1,4 +1,4 @@
-# fx_timesfm: Minimal Decoder-Only Foundation Model for FX Forecasting
+# ZFXT : Minimal Decoder-Only Foundation Model for FX Forecasting
 
 This repo provides a from-scratch, clean PyTorch implementation of a TimesFM-inspired, decoder-only transformer for time-series forecasting with patch tokens—specialized for foreign exchange (FX) rates.
 
