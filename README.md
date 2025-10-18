@@ -204,7 +204,6 @@ Resultater/           # Optional figures for papers (images only committed)
 README.md             # This file
 LICENSE               # MIT license
 requirements.txt      # Python dependencies
-PUBLISHING.md         # Pre-publish checklist
 ```
 
 ## Example: EUR/NOK inference demo (Norges Bank data)
