@@ -1,0 +1,143 @@
+\section{Decoder-Only Patch-Token FX Foundation Model (TimesFM-Inspired)}
+\label{sec:fx_timesfm}
+\noindent This document formalizes the full pipeline implemented in this repository, using the same mathematical style as the TimesFM theory section. We denote by $y_{1:L} = (y_1, \ldots, y_L)$ a univariate historical context (e.g., daily EUR/NOK). Our goal is to produce a forecast path $\widehat{y}_{L+1:L+H}$ of horizon $H$ and evaluate it against baselines (e.g., driftless random walk, RW).
+
+\subsection{Positioning and Zero-Shot Objective}
+\label{sec:positioning}
+\noindent The model is a \emph{decoder-only}, patch-based Transformer, inspired by TimesFM \parencite{Das2024TimesFM}. It is trained (pretrained) to deliver strong \emph{zero-shot} forecasts on unseen series without task-specific fine-tuning. The design treats contiguous segments of real-valued sequences as tokens (``patch-tokens'') and relies on causal self-attention to autoregressively decode future patches. Compared with LLM-style numeric tokenization, patch tokens avoid brittle text encodings; compared with any-variate encoders, the decoder-centric design emphasizes fast, simple, horizon-flexible inference for univariate or channel-independent multivariate settings \parencite{Gruver2024LLMTime,Woo2024MOIRAI}.
+
+\subsection{Architecture: Patch-Tokens and Causal Decoding}
+\label{sec:arch}
+Let $p$ be the input patch length and $h$ the output patch length. Partition the context into non-overlapping patches
+\[
+\tilde y_j \equiv y_{p(j-1)+1:pj}, \qquad j = 1,\ldots,N=\left\lfloor \frac{L}{p} \right\rfloor.
+\]
+Each patch is mapped to a token $t_j \in \mathbb{R}^{d}$ via a residual MLP (``ResidualBlock'') and sinusoidal positional encodings. A stack of $n_\ell$ Transformer blocks with \emph{causal} multi-head attention computes outputs
+\begin{equation}
+ o_j = \mathrm{Transformer}\!\left((t_1,\dot m_1),\ldots,(t_j,\dot m_j)\right), \quad j=1,\ldots,N,
+ \label{eq:transformer}
+\end{equation}
+where $\dot m_j\in\{0,1\}$ is a patch-level mask (Sec.~\ref{sec:mask}). Each $o_j$ is projected to an \emph{output patch} of length $h$ via a small MLP head:
+\begin{equation}
+ \widehat{y}_{pj+1:pj+h} = \mathrm{OutMLP}(o_j).
+ \label{eq:out_head}
+\end{equation}
+Crucially, $h\ge p$ so that long horizons require \emph{fewer} decoding steps: inference cost scales with $H/h$ rather than $H$.
+
+\paragraph{Tokens are numeric patches.} Unlike LLM-based zero-shot forecasting, a token here is a numeric window of values, not a text token. This avoids numeric BPE artifacts and preserves native value scales.
+
+\subsection{Masking, Normalization, and Training Objective}
+\label{sec:mask}
+\paragraph{Variable-context masking.} To train robustness to \emph{all} context lengths up to $L_\text{max}$, we randomly mask an offset $r\in\{0,\ldots,p-1\}$ within the \emph{first} input patch at training time. Let $M\in\{0,1\}^{N\times p}$ be the observation mask with $M_{1,1:r}=1$ (masked) and padded positions masked as well. The masked input is $\tilde y\odot(\mathbf{1}-M)$.
+
+\paragraph{Reversible instance normalization.} For each training sample, compute first-patch mean/std
+\begin{equation}
+ \mu \;=\; \frac{1}{p}\sum_{k=1}^{p} y_k, \qquad \sigma = \sqrt{\frac{1}{p}\sum_{k=1}^{p}(y_k-\mu)^2 + \varepsilon}, \quad \varepsilon>0,
+ \label{eq:instnorm}
+\end{equation}
+then normalize all tokens by $x = (\tilde y-\mu)/\sigma$. At inference we denormalize via $\widehat y = \sigma\,\widehat x + \mu$. We use \emph{scalar} $\mu,\sigma$ computed from the \emph{first} input patch to ensure consistent broadcasting and stability across scales.
+
+\paragraph{Training target.} For token $j$, the target is the next $h$ values from the concatenated raw sequence (rolling horizon). If the horizon extends past the available sequence, we mask those positions in the loss.
+
+\paragraph{Loss.} The primary objective is MSE over valid positions,
+\begin{equation}
+ \mathcal{L}_\text{MSE} = \frac{1}{\sum w} \sum_{j=1}^{N} \sum_{u=1}^{h} w_{j,u}\, \left(\widehat{x}_{j,u} - x^{\text{tgt}}_{j,u}\right)^2,
+ \label{eq:loss_mse}
+\end{equation}
+where $w_{j,u}\in\{0,1\}$ indicates horizon validity and $\widehat{x}$, $x^{\text{tgt}}$ are in normalized space. Optional quantile heads minimize pinball loss for probabilistic outputs.
+
+\subsection{Autoregressive Inference and Anchoring}
+\label{sec:inference}
+Given a context $y_{1:L}$ and desired horizon $H$, define $N=\lceil L/p \rceil$ patches using \emph{edge padding} to the last observed value when $L \mod p \neq 0$ (to avoid level distortion). Normalize using first-patch $(\mu,\sigma)$ from \eqref{eq:instnorm}. At step $j=N$, apply \eqref{eq:out_head} to obtain $\widehat{y}_{pj+1:pj+h}$. Concatenate to the context and, for continued decoding, form a new input token by taking the first $p$ points of the predicted patch (or an equivalent lightweight projection).
+
+\paragraph{Anchoring for continuity.} To ensure continuity at forecast start, we \emph{anchor} the generated path so that its first forecast equals the last observed value:
+\begin{equation}
+ \widehat{y}^{\,\text{anch}}_{L+u} \;=\; \widehat{y}_{L+u} + \big(y_L - \widehat{y}_{L+1}\big), \qquad u=1,\ldots,H.
+ \label{eq:anchor}
+\end{equation}
+Implementation detail: $y_L$ is the \emph{last real observation before padding}; anchoring never uses padded values. This prevents the initial ``gap'' artifact. All patching utilities use edge padding and all inference paths apply Eq.~\eqref{eq:anchor} when anchoring is enabled.
+
+\subsection{Data Pipeline: FX Ingestion and Resampling}
+\label{sec:data_pipeline}
+\paragraph{Source.} We fetch FX rates via the Norges Bank EXR API (robust CSV parsing with caching). Each record has UTC timestamp and mid-price.
+
+\paragraph{Resampling.} We construct canonical views with forward-fill for missing days:
+\[
+\text{Daily: } y_t = \mathrm{ffill\_D}(\text{EXR}); \qquad \text{Month-End (ME) and Quarter-End (QE): } y_t = \mathrm{ffill\_\{ME,QE\}}(\text{EXR}).
+\]
+These ensure well-defined targets at month/quarter ends.
+
+\paragraph{Context window.} For walk-forward or evaluation cutoffs, we extract the last $L_\text{ctx}$ observations prior to the origin (e.g., last day before quarter start), with $L_\text{ctx}\le L_\text{max}$.
+
+\subsection{Training Routine}
+\label{sec:training}
+\paragraph{Model sizes.} We provide small/medium/large presets. For example, a small preset uses $(d, n_\ell, n_\text{heads})=(512,8,8)$ (\~17M parameters). Larger presets target \~70M and \~200M.
+
+\paragraph{Optimization.} AdamW with cosine schedule and warmup; gradient clipping. Early stopping monitors the MAE gap versus RW at monthly granularity on a validation slice (fallback to negative validation MAE if the macro eval is undefined).
+
+\paragraph{Checkpoint + ModelCard.} We save best.ckpt with model state, optimizer state, config, and a ModelCard recording training frequency, context length, and snapshot metrics.
+
+\subsection{Evaluation Protocols}
+\label{sec:evaluation}
+\paragraph{Walk-forward.} For a chosen frequency (ME or QE), iterate $t=L_\text{ctx},\ldots,T$ and forecast $y_{t+1}$ using the last $L_\text{ctx}$ values; compare the model’s one-step prediction against RW ($y_t$). Output CSV and plot with history, forecast, RW.
+
+\paragraph{Quarterly cutoff evaluation.} For each quarter $Q$, let $(s_Q, e_Q)$ be quarter start/end. Define the \emph{origin} as the last day before $s_Q$ present in the daily series. Forecast to the quarter end by setting $H = (e_Q-\text{origin})$ days and taking the last point of \eqref{eq:out_head} / autoregressive rollouts; anchor with \eqref{eq:anchor}. Compare against RW (level at origin). Save per-quarter CSV with $\{\text{model},\text{rw},\text{actual}\}$ and summary metrics.
+
+\paragraph{Metrics.} Per-horizon absolute errors $|\widehat{y}-y|$; MAE over valid horizons; Diebold–Mariano (DM) test with Newey–West variance for loss differentials $d_t = |\widehat{y}^{\text{model}}_t - y_t| - |\widehat{y}^{\text{rw}}_t - y_t|$.
+
+\subsection{Mask and Attention Mechanics}
+\label{sec:attention}
+\paragraph{Causal attention.} The attention mask is boolean with \texttt{True} above the main diagonal: future positions are masked. Key padding masks mark padded tokens. Using consistent boolean dtypes avoids PyTorch deprecation warnings.
+
+\paragraph{Patch-level observation masks.} During training, the first patch’s first $r$ elements are marked as unobserved (1), and all padded elements are masked. The model sees variable effective context lengths while optimizing the same objective.
+
+\subsection{Implementation Contract}
+\label{sec:contract}
+Inputs/Outputs and shapes:
+\begin{itemize}
+  \item Input patches: $\mathbf{X} \in \mathbb{R}^{B\times T\times p}$, with padding masks $\mathbf{P}\in\{0,1\}^{B\times T\times p}$ and attention padding mask $\mathbf{A}\in\{0,1\}^{B\times T}$.
+  \item Decoder: $n_\ell$ pre-norm Transformer blocks, $d$ model width, $n_\text{heads}$ heads.
+  \item Output: $\widehat{\mathbf{Y}} \in \mathbb{R}^{B\times T\times h}$ and optional quantile tensor $\widehat{\mathbf{Q}} \in \mathbb{R}^{B\times T\times h\times Q}$.
+\end{itemize}
+Error modes and safeguards:
+\begin{itemize}
+  \item If the target horizon exceeds available sequence, mask those loss positions.
+  \item Always compute $(\mu,\sigma)$ from the first \emph{real} patch; clamp $\sigma\ge 10^{-6}$.
+  \item Use edge padding when $L\mod p\neq 0$ and anchor with Eq.~\eqref{eq:anchor} to remove initial gaps.
+\end{itemize}
+
+\subsection{Reproducibility and Configurations}
+\label{sec:repro}
+Key configuration fields:
+\begin{itemize}
+  \item Data: frequency (D/ME/QE), context length $L_\text{ctx}$, patch sizes $(p,h)$, max context patches.
+  \item Model: $(d, n_\ell, n_\text{heads})$, dropout, quantile options.
+  \item Training: lr, betas, weight decay, warmup, cosine schedule, grad clip, patience.
+\end{itemize}
+Artifacts:
+\begin{itemize}
+  \item Checkpoints in \texttt{runs/<name>/best.ckpt} with ModelCard.
+  \item Walk-forward and quarterly evaluation CSV/plots under \texttt{runs/...}.
+\end{itemize}
+
+\subsection{Limitations and Scope}
+\label{sec:limits}
+\noindent Decoder-only patch models can underperform driftless RW on certain FX endpoints (e.g., quarter-end levels) without targeted fine-tuning or horizon-aware objectives. Gains typically improve with (i) scaling $(d, n_\ell, n_\text{heads})$, (ii) longer $h$ for fewer decoding steps, (iii) curriculum or fine-tuning aligned to evaluation granularity, and (iv) distributional heads when probabilistic scoring is required.
+
+\subsection{File Index and Entrypoints}
+\label{sec:index}
+\begin{itemize}
+  \item \texttt{fx\_timesfm/model.py}: ResidualBlock, TransformerBlock, DecoderOnlyTSModel (forward, generate).
+  \item \texttt{fx\_timesfm/masking.py}: variable-context mask, causal attention mask (boolean).
+  \item \texttt{fx\_timesfm/normalization.py}: first-patch reversible normalization utilities.
+  \item \texttt{fx\_timesfm/train.py}: training loop, early stopping, ModelCard save.
+  \item \texttt{fx\_timesfm/infer.py}: generic inference, resampling, anchoring, demo pipeline.
+  \item \texttt{fx\_timesfm/data\_sources/norgesbank.py}: EXR fetcher with caching.
+  \item \texttt{fx\_timesfm/scripts/walk\_forward\_nb.py}: walk-forward predictions and plot.
+  \item \texttt{fx\_timesfm/scripts/quarterly\_eval\_nb.py}: quarterly cutoff evaluation with DM test.
+  \item \texttt{fx\_timesfm/plot\_utils.py}: plotting utilities (history, forecast, RW, optional actuals).
+  \item \texttt{fx\_timesfm/evaluation.py}: RW baseline, Diebold–Mariano.
+\end{itemize}
+
+\subsection{Citations}
+Use the same bibliography entries cited in TimesFM: \textcite{Das2024TimesFM}, \textcite{Gruver2024LLMTime}, \textcite{Woo2024MOIRAI}.

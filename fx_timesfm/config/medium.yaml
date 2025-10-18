@@ -1,0 +1,7 @@
+inherits: default
+model:
+  preset: medium
+  d_model: 1024
+  n_layers: 16
+  n_heads: 16
+  dropout: 0.2

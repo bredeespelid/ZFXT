@@ -1,0 +1,38 @@
+inherits: small
+
+data:
+  train_paths: ["data_nb_70_99/train.csv"]
+  val_paths:   ["data_nb_70_99/val.csv"]
+  test_paths:  ["data_nb_70_99/test.csv"]
+  timestamp_col: timestamp
+  symbol_col: symbol
+  price_col: price
+  # Use daily frequency; resample upstream fetcher already outputs daily
+  freq: "1D"
+  resample: true
+  fill_method: ffill
+  context_len: 512
+  input_patch_len: 32
+  output_patch_len: 128
+  horizon: 256
+  max_context_patches: 16
+  batch_size: 16
+  num_workers: 2
+
+model:
+  preset: small
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  dropout: 0.2
+
+trainer:
+  epochs: 2
+  lr: 3.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  grad_clip_norm: 1.0
+  cosine_decay: true
+  warmup_steps: 200
+  early_stop_patience: 3
+  ckpt_dir: "runs/nb_1970_1999"

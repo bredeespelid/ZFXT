@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+# Treat common binaries as binary
+graphics/* binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.svg binary
+*.pdf binary
+
+# Keep Mermaid as text
+*.mmd text eol=lf
+
+# Ensure notebooks keep line endings consistent
+*.ipynb text eol=lf

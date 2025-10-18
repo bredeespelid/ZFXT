@@ -1,0 +1,236 @@
+Decoder-Only Patch-Token FX (TimesFM-Inspired) – Revised Theory + Build Notes
+
+This document is a thesis-ready, end-to-end description of the codebase and methodology implemented in this repository. It expands your current section with formal equations, leakage considerations, and implementation details that reflect exactly what is in code.
+
+---------------------------------------------------------------------
+1) High-level objective and setting
+---------------------------------------------------------------------
+We consider a univariate time series y_{1:L} = (y_1, …, y_L), e.g., EUR/NOK. The goal is to forecast future values y_{L+1:L+H}. The system is a decoder-only Transformer over numeric patch tokens, inspired by TimesFM. It is trained to be strong in zero-shot settings and supports autoregressive decoding for arbitrary horizons H.
+
+Notation:
+- p: input patch length (token length)
+- h: output patch length per decoding step
+- d: model width
+- n_ℓ: number of Transformer blocks (layers)
+- N = ⌈L / p⌉: number of input tokens after patchify
+
+---------------------------------------------------------------------
+2) Data interfaces and preprocessing
+---------------------------------------------------------------------
+2.1 Ingestion
+- Primary source: Norges Bank EXR (fx_timesfm/data_sources/norgesbank.py) with caching.
+- CSV ingestion: robust parsing (also handles semicolon-separated files).
+
+2.2 Resampling
+- Daily (D) series are forward-filled to handle missing dates.
+- Month-end (ME) and quarter-end (QE) are derived using forward-fill at the calendar endpoints.
+- In code: fx_timesfm/resample.py and helpers inside infer/scripts.
+
+2.3 Train/eval context windows
+- For walk-forward and quarterly cutoff evaluation, an origin date is chosen and the last L_ctx observations prior to origin form the context.
+
+2.4 Patchify with edge padding
+Given context length L and input patch size p:
+- Compute N = ⌈L / p⌉; pad y with its last observed value so that N·p points exist (edge padding preserves level).
+- Form tokens as contiguous non-overlapping patches: ỹ_j = y_{p(j-1)+1 : pj}, j=1..N.
+
+---------------------------------------------------------------------
+3) Reversible instance normalization
+---------------------------------------------------------------------
+We normalize all token values with a scalar mean/standard deviation obtained from the first real patch (never from padding):
+  μ = (1/p) ∑_{k=1}^p y_k
+  σ = sqrt( (1/p) ∑_{k=1}^p (y_k − μ)^2 + ε ), ε>0
+Normalized inputs: x = (ỹ − μ) / σ. During inference, denormalize forecasts via: ŷ = σ·x̂ + μ.
+Implementation: fx_timesfm/normalization.py and usage in model/infer.
+
+---------------------------------------------------------------------
+4) Masking
+---------------------------------------------------------------------
+4.1 Variable-context observation masking (training)
+- To make the model robust to variable effective context, a random offset r ∈ {0,…,p−1} is applied within the first token; the first r positions are treated as unobserved.
+- Padded positions are also masked in the loss.
+
+4.2 Causal attention and key padding masks (inference/training)
+- The causal attention mask is boolean with True where future positions should be masked (strictly upper triangular).
+- A separate key padding mask marks token positions that correspond to padding.
+- Code detail: boolean masks are used to avoid PyTorch dtype deprecation warnings. See fx_timesfm/masking.py.
+
+---------------------------------------------------------------------
+5) Tokenization and embeddings
+---------------------------------------------------------------------
+Each numeric patch ỹ_j ∈ R^p is projected to a token t_j ∈ R^d by a small residual MLP (“ResidualBlock”). A sinusoidal positional encoding is added. The stack of n_ℓ pre-norm Transformer blocks processes the sequence.
+
+Let T ∈ R^{N×d} be the embedded token matrix; per-head attention uses (Q,K,V) projections:
+  Q = T W_Q,  K = T W_K,  V = T W_V, with W_* ∈ R^{d×d_h} per head.
+Scaled dot-product attention with causal/padding masks:
+  Attn(T) = Softmax( (Q K^T) / sqrt(d_h) + mask ) V.
+Output of each block is passed through residual connections and MLP, using pre-norm (LayerNorm before sublayers).
+
+---------------------------------------------------------------------
+6) Decoder output head and horizon packing
+---------------------------------------------------------------------
+For each input token j, the model produces an output patch of length h through an MLP head:
+  o_j = DecoderBlockStack( t_{1:j} )
+  x̂_{j,1:h} = OutMLP(o_j)
+If j=N corresponds to the final context token, x̂_{N,·} represents the next h steps (in normalized units). After denorm, this yields ŷ_{L+1:L+h}. For longer horizons, we concatenate predictions and continue decoding autoregressively.
+
+---------------------------------------------------------------------
+7) Training objective
+---------------------------------------------------------------------
+Primary loss: masked MSE in normalized space over valid targets (across all produced patches),
+  L_MSE = (1/∑w) ∑_{j=1}^N ∑_{u=1}^h w_{j,u} (x̂_{j,u} − x^{tgt}_{j,u})^2.
+Optional: quantile (pinball) loss for probabilistic outputs (not required for point forecasts in this repo’s main runs).
+
+Optimization details:
+- AdamW, cosine decay with warmup; gradient clipping.
+- Early stopping optionally monitors MAE gap vs RW on a validation slice; fallback = −val MAE.
+- Checkpointing with ModelCard (fx_timesfm/model_card.py) stores config and summary metrics.
+
+---------------------------------------------------------------------
+8) Autoregressive inference and anchoring
+---------------------------------------------------------------------
+Given context y_{1:L}:
+1) Patchify with edge padding to multiples of p; compute μ, σ from first real patch.
+2) Run the decoder to produce the next h points.
+3) (Optional) Continue decoding by rolling the window or re-tokenizing efficiently.
+4) Anchoring for continuity: ensure the first forecast equals the last real observation y_L.
+   Implemented by shifting the entire forecast patch by (y_L − ŷ_{L+1}).
+Important: y_L is the last pre-padding real value. Anchoring is never computed with padded values.
+
+Complexity note: Runtime scales roughly with (H/h) decoding steps rather than H.
+
+---------------------------------------------------------------------
+9) Baseline, metrics, and statistical testing
+---------------------------------------------------------------------
+9.1 Random Walk (RW)
+- RW one-step: ŷ^{RW}_{t+1} = y_t.
+- For quarter-ahead from an origin t₀, RW predicts the level y_{t₀} for all future dates within the quarter; the quarter-end point equals y_{t₀}.
+
+9.2 Metrics
+- MAE = (1/T) ∑ |ŷ_t − y_t|, RMSE = sqrt((1/T) ∑ (ŷ_t − y_t)^2).
+
+9.3 Diebold–Mariano (DM) test with Newey–West (HAC) variance
+- Loss differential: d_t = ℓ(ŷ^{model}_t, y_t) − ℓ(ŷ^{rw}_t, y_t), with ℓ = absolute error.
+- Test H₀: E[d_t] = 0. HAC variance uses Newey–West with bandwidth suited to forecast horizon.
+- Implemented in fx_timesfm/evaluation.py.
+
+---------------------------------------------------------------------
+10) Evaluation protocols implemented
+---------------------------------------------------------------------
+10.1 Daily walk-forward (one-step)
+- For each day t, forecast y_{t+1} from the last L_ctx observations; compare to RW.
+- In code: fx_timesfm/scripts/walk_forward_nb.py (FX from API) and fx_timesfm/scripts/walk_forward_covariates.py (CSV-driven).
+
+10.2 Quarterly cutoff evaluation (multi-step to quarter end)
+- For quarter Q with start s_Q and end e_Q, define origin as the last available day before s_Q.
+- Forecast recursively to e_Q using only past prices at origin; apply anchoring; compare with RW.
+- In code: fx_timesfm/scripts/quarterly_eval_nb.py.
+
+10.3 Aggregating daily predictions to quarter-end
+- When using daily one-step predictions (optionally with covariates), select the prediction made on the quarter-end date.
+- In code: fx_timesfm/scripts/quarterly_from_wf.py; metrics: MAE, RMSE, DM.
+
+---------------------------------------------------------------------
+11) Covariate-aware daily walk-forward (leakage-safe)
+---------------------------------------------------------------------
+We use the foundation model to get a base one-step prediction and then adjust it with a rolling linear model on residuals.
+
+Definitions:
+- Base prediction (model-only): \tilde{y}_{t+1} = f_θ(y_{t−L_ctx+1:t}).
+- Residual: r_t = y_t − \tilde{y}_t.
+- Covariates: X_t ∈ R^m (e.g., Q, d_pi, dI_t). To avoid leakage, use X_{t−ℓ} with lag ℓ ≥ 0 when X_t is not contemporaneously known.
+
+Rolling ridge regression on residuals over a window W ⊆ {1,…,t−1}:
+- Standardize X over W: X̂_i = clip((X_i − μ_W)/σ_W, −5, 5).
+- Solve β = argmin ||R_W − X̂_W β||² + λ||β||² (λ small > 0).
+- Adjustment: Δ_{t+1} = x̂_{t+1}^T β, where x̂ uses the same standardization/clip and appropriate lag.
+- Stability: Clip Δ by k·std(R_W) (k≈3) with a minimum bound to avoid near-zero adjustments.
+- Final forecast: ŷ_{t+1} = \tilde{y}_{t+1} + Δ_{t+1}.
+
+Strict quarter-ahead (origin) mode with covariates:
+- Origin at day before quarter start; coefficients β fit using data up to origin only.
+- Covariate values beyond origin come from a strategy (carry-forward or zero), with explicit lag ℓ.
+- Implementation in walk_forward_covariates.py (--to_quarter_end, --cov_lag, --cov_strategy).
+
+Leakage policy:
+- Price targets: never use y beyond the prediction time.
+- Covariates: do not use X_t unless X_t is known at t; otherwise use lagged X_{t−ℓ}.
+
+---------------------------------------------------------------------
+12) Implementation contract (I/O shapes and masks)
+---------------------------------------------------------------------
+- Inputs: X ∈ R^{B×T×p} are patch tokens; attention padding mask A ∈ {False,True}^{B×T} marks padded tokens.
+- Outputs: Ŷ ∈ R^{B×T×h} (optionally quantiles).
+- Loss masking: per-output validity mask W ∈ {0,1}^{B×T×h}; observation mask inside the first token simulates variable context.
+
+---------------------------------------------------------------------
+13) Reproducibility and artifacts
+---------------------------------------------------------------------
+- Configs in fx_timesfm/config/*.yaml define model/data/training knobs.
+- Checkpoints under runs/<name>/best.ckpt include weights and config; ModelCard records training/eval metadata.
+- Scripts under fx_timesfm/scripts provide end-to-end entrypoints (training, inference, plotting, metrics).
+- Unit tests: fx_timesfm/tests/test_patching.py, test_norm_roundtrip.py, test_masking.py, test_forward_shapes.py.
+
+---------------------------------------------------------------------
+14) Practical details reflected in code
+---------------------------------------------------------------------
+- Boolean attention masks remove PyTorch dtype warnings (masking.py).
+- Edge padding avoids initial level dips and stabilizes normalization; combined with anchoring, the first forecast point is continuous with y_L.
+- CSV robustness: auto-detects separators; allows semicolon-delimited headers.
+- Windows-friendly scripts (no fork required; pure Python loops for inference/training).
+
+---------------------------------------------------------------------
+15) Verified evaluation outputs in this repo
+---------------------------------------------------------------------
+- Quarterly evaluation (EUR/NOK 2000–2024): metrics.txt contains MAE_model, MAE_rw, gap, DM_p; plot saved as quarterly_actual_vs_pred.jpeg.
+- Daily covariate runs: walk_forward_cov.csv/.jpeg; aggregated quarterly CSV/plot/metrics via quarterly_from_wf.py.
+- Price-only and extended-covariate variants follow the same pattern.
+
+---------------------------------------------------------------------
+16) Limitations and future work
+---------------------------------------------------------------------
+- RW competitiveness at FX endpoints: Improve with horizon-aware training, larger models, or fine-tuning on quarter-end targets.
+- Multi-step covariate usage: requires assumptions on exogenous paths; integrating a small exogenous forecaster can reduce mismatch.
+- Probabilistic evaluation: enable quantile heads and CRPS/Pinball metrics; calibration analysis.
+- Multi-asset conditioning: allow cross-series context without leakage via causal cross-attention.
+
+---------------------------------------------------------------------
+17) How the code was built up (chronology)
+---------------------------------------------------------------------
+1) Baseline decoder-only patch Transformer (model.py) with normalization/masking (normalization.py, masking.py).
+2) Inference path with anchoring and edge padding (infer.py), boolean masks.
+3) Data fetch and resampling (data_sources/norgesbank.py, resample.py), cache & CLI demo.
+4) Training loop (train.py), configs, checkpoints + ModelCard.
+5) Evaluation scripts: walk-forward, quarterly cutoff (scripts/*), plotting utilities (plot_utils.py).
+6) Covariate-adjusted daily walk-forward: residual OLS with winsorization, ridge, clipping; strict origin mode with cov_lag and carry-forward.
+7) Aggregators and metrics (quarterly_from_wf.py, evaluation.py with DM test), extra plotting and metrics utils.
+8) Tests for patching, masking, normalization roundtrip, and forward shapes.
+
+---------------------------------------------------------------------
+18) File index (what to cite in the thesis)
+---------------------------------------------------------------------
+- fx_timesfm/model.py – Residual MLP tokens, Transformer blocks, decoding/generation.
+- fx_timesfm/masking.py – Causal boolean masks, padding masks, variable-context masks.
+- fx_timesfm/normalization.py – First-patch reversible normalization utilities.
+- fx_timesfm/train.py – Training loop, schedulers, early stopping, checkpointing.
+- fx_timesfm/infer.py – Inference helpers, anchoring, resampling.
+- fx_timesfm/evaluation.py – RW baseline and Diebold–Mariano test (Newey–West).
+- fx_timesfm/plot_utils.py – Unified plotting.
+- fx_timesfm/resample.py – Frequency conversions (D/ME/QE).
+- fx_timesfm/data_sources/norgesbank.py – Robust EXR ingestion with caching.
+- fx_timesfm/scripts/* – End-to-end entrypoints (walk-forward, quarterly eval, metrics, plots, covariate runs).
+- fx_timesfm/tests/* – Minimal tests for core invariants.
+
+---------------------------------------------------------------------
+19) Minimal run recipes (for the thesis appendix)
+---------------------------------------------------------------------
+- Quarterly cutoff (EUR/NOK):
+  python -m fx_timesfm.scripts.quarterly_eval_nb --ckpt runs/nb_1970_1999/best.ckpt --base EUR --quote NOK --start 2000-01-01 --end 2024-12-31 --context_len 512 --out runs/quarterly_eval_eurnok_2000_2024_anchored
+- Covariate daily walk-forward (CSV):
+  python -m fx_timesfm.scripts.walk_forward_covariates --ckpt runs/nb_1970_1999/best.ckpt --csv dataset_eksogene.csv --context_len 512 --covariates Q,d_pi,dI_t --out runs/wf_cov_eurnok
+- Aggregate daily → quarterly:
+  python -m fx_timesfm.scripts.quarterly_from_wf --csv runs/wf_cov_eurnok/walk_forward_cov.csv
+- Strict quarter-ahead with covariates from origin:
+  python -m fx_timesfm.scripts.walk_forward_covariates --ckpt runs/nb_1970_1999/best.ckpt --csv dataset_endogene.csv --context_len 512 --covariates Q,d_pi,dI_t --to_quarter_end --cov_lag 1 --cov_strategy carryforward --out runs/wf_endogene
+
+This revised text covers: formal attention equations, masking/normalization math, anchoring definition, RW baseline, DM test with HAC variance, covariate residual modeling with leakage policy, and exact file/entrypoint mapping to the repository.

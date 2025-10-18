@@ -1,0 +1,33 @@
+seed: 42
+device: cuda
+
+data:
+  train_csv: data_any/train.csv
+  val_csv: data_any/val.csv
+  test_csv: data_any/test.csv
+  frequency: D
+  min_timestamp: "2000-01-01"
+  input_patch_len: 32
+  output_patch_len: 128
+  context_len: 512
+
+model:
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  dropout: 0.20
+
+trainer:
+  batch_size: 64
+  epochs: 50
+  lr: 3e-4
+  optimizer: AdamW
+  cosine: true
+  grad_clip: 1.0
+  early_stop_metric: mae_gap_vs_rw_monthly
+  patience: 5
+
+eval:
+  monthly:   { enabled: true, horizon_steps: 1 }
+  quarterly: { enabled: true, horizon_steps: 1 }
+  dm_test: true

@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Unit test / coverage reports
+.coverage
+.pytest_cache/
+htmlcov/
+coverage.xml
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VSCode
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project data/outputs
+data/
+checkpoints/
+outputs/
+logs/
+runs/
+data_nb_70_99/
+
+# Walk-forward/result artifacts
+# Ignore all by default, but allow images for figures in papers/thesis
+Resultater/**
+!Resultater/**/*.png
+!Resultater/**/*.jpg
+!Resultater/**/*.jpeg
+!Resultater/**/*.svg
+
+# Parquet/CSV heavy files (keep large raw data out of repo)
+*.parquet
+*.csv
+
+# Local tooling and editor state
+.vscode/
+.idea/
+*.code-workspace
+
+# OS / misc
+*.bak
+*.tmp
+*.log
+
+# Python cache
+*.pyo
+*.pyd

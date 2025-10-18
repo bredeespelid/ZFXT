@@ -1,0 +1,24 @@
+inherits: small
+data:
+  train_paths: ["data/train.csv"]
+  val_paths: ["data/val.csv"]
+  test_paths: ["data/test.csv"]
+  timestamp_col: timestamp
+  symbol_col: symbol
+  price_col: price
+  freq: "1D"
+  resample: true
+  fill_method: ffill
+  context_len: 512
+  input_patch_len: 32
+  output_patch_len: 128
+  horizon: 256
+  max_context_patches: 16
+  batch_size: 16
+  num_workers: 2
+model:
+  preset: small
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  dropout: 0.2

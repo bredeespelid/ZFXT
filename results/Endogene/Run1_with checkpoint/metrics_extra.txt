@@ -1,0 +1,4 @@
+Observations: 103
+MAE_model: 0.17327119046992973
+RMSE_model: 0.2637696848821748
+DM_p (two-sided, loss=abs): 3.219646771412954e-14

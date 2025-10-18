@@ -1,0 +1,54 @@
+seed: 42
+device: cpu
+
+data:
+  train_paths: ["data/train.csv"]
+  val_paths: ["data/val.csv"]
+  test_paths: ["data/test.csv"]
+  symbols: []  # empty => all
+  timestamp_col: timestamp
+  symbol_col: symbol
+  price_col: price
+  freq: "1H"
+  resample: true
+  fill_method: ffill
+  train_start: null
+  train_end: null
+  val_start: null
+  val_end: null
+  test_start: null
+  test_end: null
+
+  context_len: 512
+  input_patch_len: 32
+  output_patch_len: 128
+  horizon: 256
+  max_context_patches: 16  # 16 * 32 = 512
+
+  batch_size: 8
+  num_workers: 2
+
+model:
+  preset: small  # small | medium | large
+  dropout: 0.2
+  quantiles: false
+  quantile_levels: [0.1, 0.5, 0.9]
+
+trainer:
+  epochs: 2
+  lr: 3.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  grad_clip_norm: 1.0
+  cosine_decay: true
+  warmup_steps: 200
+  ema: false
+  ema_decay: 0.999
+  log_interval: 50
+  val_interval: 200
+  early_stop_patience: 5
+  ckpt_dir: "checkpoints"
+
+metrics:
+  - mae
+  - msmape
